@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import base64
 import hashlib
 import json
@@ -21,6 +22,7 @@ try:
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
     from eth_account import Account
     from web3 import Web3
 except ImportError as exc:
@@ -39,6 +41,14 @@ DEFAULT_RPC_URLS = [
 SCRIPT_DIR = Path(__file__).resolve().parent
 KEY_FILE = SCRIPT_DIR / "wallet_sepolia.key.txt"
 STATE_FILE = SCRIPT_DIR / "sfs_root.txt"
+
+WALLET_KEYSTORE_KIND = "sfs-wallet-keystore"
+WALLET_KEYSTORE_VERSION = 1
+WALLET_PASSWORD_ENV = "SFS_WALLET_PASSWORD"
+WALLET_SCRYPT_N = 2**14
+WALLET_SCRYPT_R = 8
+WALLET_SCRYPT_P = 1
+WALLET_SCRYPT_LENGTH = 32
 
 MAGIC_V1 = b"SFS1"
 MAGIC_V2 = b"SFS2"
@@ -317,24 +327,181 @@ def connect_web3() -> tuple[Web3, str]:
 # Wallet
 # --------------------
 
-def load_or_create_wallet() -> tuple[object, bytes]:
+def is_wallet_keystore_text(text: str) -> bool:
+    stripped = text.lstrip()
+    if not stripped.startswith("{"):
+        return False
+    try:
+        data = json.loads(stripped)
+    except json.JSONDecodeError:
+        return False
+    return data.get("kind") == WALLET_KEYSTORE_KIND
 
+
+def wallet_file_is_encrypted() -> bool:
+    if not KEY_FILE.is_file():
+        return False
+    return is_wallet_keystore_text(KEY_FILE.read_text(encoding="utf-8"))
+
+
+def prompt_password(prompt: str, *, allow_empty: bool, confirm: bool = False) -> str:
+    env_password = os.getenv(WALLET_PASSWORD_ENV)
+    if env_password is not None:
+        return env_password
+
+    if not sys.stdin.isatty():
+        if allow_empty:
+            return ""
+        raise StoreError(
+            f"Wallet cifrato: password richiesta. "
+            f"Imposta {WALLET_PASSWORD_ENV} oppure esegui il comando in un terminale interattivo."
+        )
+
+    password = getpass.getpass(prompt)
+    if not password and not allow_empty:
+        raise StoreError("Password richiesta per aprire il wallet cifrato")
+
+    if confirm and password:
+        password_again = getpass.getpass("Ripeti password wallet: ")
+        if password != password_again:
+            raise StoreError("Le password non coincidono")
+
+    return password
+
+
+def derive_wallet_kek(password: str, salt: bytes, kdf_params: dict | None = None) -> bytes:
+    params = kdf_params or {}
+    n = int(params.get("n", WALLET_SCRYPT_N))
+    r = int(params.get("r", WALLET_SCRYPT_R))
+    p = int(params.get("p", WALLET_SCRYPT_P))
+    length = int(params.get("length", WALLET_SCRYPT_LENGTH))
+    kdf = Scrypt(salt=salt, length=length, n=n, r=r, p=p)
+    return kdf.derive(password.encode("utf-8"))
+
+
+def encrypt_wallet_private_key(private_key: bytes, password: str) -> dict:
+    salt = os.urandom(16)
+    nonce = os.urandom(12)
+    kdf_params = {
+        "name": "scrypt",
+        "n": WALLET_SCRYPT_N,
+        "r": WALLET_SCRYPT_R,
+        "p": WALLET_SCRYPT_P,
+        "length": WALLET_SCRYPT_LENGTH,
+    }
+    kek = derive_wallet_kek(password, salt, kdf_params)
+    aad = f"{WALLET_KEYSTORE_KIND}:v{WALLET_KEYSTORE_VERSION}".encode("utf-8")
+    ciphertext = AESGCM(kek).encrypt(nonce, private_key, aad)
+    account = Account.from_key(private_key)
+    return {
+        "kind": WALLET_KEYSTORE_KIND,
+        "version": WALLET_KEYSTORE_VERSION,
+        "address": account.address,
+        "kdf": kdf_params,
+        "salt_b64": b64e(salt),
+        "cipher": "AES-256-GCM",
+        "nonce_b64": b64e(nonce),
+        "ciphertext_b64": b64e(ciphertext),
+    }
+
+
+def decrypt_wallet_private_key(keystore: dict, password: str) -> bytes:
+    if keystore.get("kind") != WALLET_KEYSTORE_KIND:
+        raise StoreError("Formato wallet cifrato non riconosciuto")
+    if int(keystore.get("version", 0)) != WALLET_KEYSTORE_VERSION:
+        raise StoreError("Versione wallet cifrato non supportata")
+    if keystore.get("cipher") != "AES-256-GCM":
+        raise StoreError("Cipher wallet non supportato")
+
+    salt = b64d(keystore["salt_b64"])
+    nonce = b64d(keystore["nonce_b64"])
+    ciphertext = b64d(keystore["ciphertext_b64"])
+    kdf_params = keystore.get("kdf") or {}
+    if kdf_params.get("name") != "scrypt":
+        raise StoreError("KDF wallet non supportata")
+
+    try:
+        kek = derive_wallet_kek(password, salt, kdf_params)
+        aad = f"{WALLET_KEYSTORE_KIND}:v{WALLET_KEYSTORE_VERSION}".encode("utf-8")
+        private_key = AESGCM(kek).decrypt(nonce, ciphertext, aad)
+    except Exception as exc:
+        raise StoreError("Password wallet errata o keyfile corrotto") from exc
+
+    validate_private_key(private_key)
+    return private_key
+
+
+def validate_private_key(private_key: bytes) -> None:
+    if len(private_key) != 32:
+        raise StoreError("Private key non valida: lunghezza diversa da 32 bytes")
+    # Account.from_key fa anche la validazione dei limiti della chiave secp256k1.
+    Account.from_key(private_key)
+
+
+def load_private_key_from_key_file() -> bytes:
+    text = KEY_FILE.read_text(encoding="utf-8").strip()
+
+    if is_wallet_keystore_text(text):
+        keystore = json.loads(text)
+        password = prompt_password("Password wallet: ", allow_empty=False)
+        return decrypt_wallet_private_key(keystore, password)
+
+    key_hex = text
+    if key_hex.startswith("0x"):
+        key_hex = key_hex[2:]
+    try:
+        private_key = bytes.fromhex(key_hex)
+    except ValueError as exc:
+        raise SystemExit(f"Private key non valida in {KEY_FILE}") from exc
+    validate_private_key(private_key)
+    return private_key
+
+
+def write_wallet_key_file(private_key: bytes, password: str) -> None:
+    validate_private_key(private_key)
+    if password:
+        keystore = encrypt_wallet_private_key(private_key, password)
+        text = json.dumps(keystore, indent=2, sort_keys=True) + "\n"
+    else:
+        text = private_key.hex() + "\n"
+    atomic_write_text(KEY_FILE, text)
+
+
+def load_or_create_wallet() -> tuple[object, bytes]:
     if KEY_FILE.exists():
-        key_hex = KEY_FILE.read_text(encoding="utf-8").strip()
-        if key_hex.startswith("0x"):
-            key_hex = key_hex[2:]
-        try:
-            private_key = bytes.fromhex(key_hex)
-        except ValueError as exc:
-            raise SystemExit(f"Private key non valida in {KEY_FILE}") from exc
+        private_key = load_private_key_from_key_file()
         account = Account.from_key(private_key)
     else:
         account = Account.create()
         private_key = bytes(account.key)
-        atomic_write_text(KEY_FILE, private_key.hex())
-        print(f"[OK] Nuovo wallet creato: {KEY_FILE}")
+        password = prompt_password(
+            "Password nuovo wallet (Invio = non cifrare): ",
+            allow_empty=True,
+            confirm=True,
+        )
+        write_wallet_key_file(private_key, password)
+        mode = "cifrato" if password else "non cifrato"
+        print(f"[OK] Nuovo wallet creato ({mode}): {KEY_FILE}")
 
     return account, private_key
+
+
+def rewrite_wallet_password(*, remove: bool = False) -> str:
+    if not KEY_FILE.exists():
+        raise StoreError("Wallet non trovato. Esegui prima: python script.py wallet")
+
+    private_key = load_private_key_from_key_file()
+    if remove:
+        new_password = ""
+    else:
+        new_password = prompt_password(
+            "Nuova password wallet (Invio = rimuovi cifratura): ",
+            allow_empty=True,
+            confirm=True,
+        )
+
+    write_wallet_key_file(private_key, new_password)
+    return "cifrato" if new_password else "non cifrato"
 
 
 def _coincurve_private_key(secret: bytes):
@@ -1533,6 +1700,13 @@ def cmd_wallet(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_key_password(args: argparse.Namespace) -> int:
+    mode = rewrite_wallet_password(remove=bool(args.remove))
+    print(f"[OK] Keyfile wallet aggiornato: {KEY_FILE}")
+    print(f"Formato                  : {mode}")
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     w3, rpc_url = connect_web3()
     state = maybe_finalize_pending_catalog(w3)
@@ -1820,6 +1994,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_wallet = sub.add_parser("wallet", help="Mostra wallet, saldo, public key e QR")
     p_wallet.add_argument("--no-qr", action="store_true", help="Non mostrare il QR ASCII")
     p_wallet.set_defaults(func=cmd_wallet)
+
+    p_key_password = sub.add_parser(
+        "key-password",
+        help="Aggiunge, cambia o rimuove la password del wallet locale",
+    )
+    p_key_password.add_argument(
+        "--remove",
+        action="store_true",
+        help="Rimuove la cifratura e salva la private key in plaintext, come nella versione originale",
+    )
+    p_key_password.set_defaults(func=cmd_key_password)
 
     p_status = sub.add_parser("status", help="Mostra ROOT e stato pendente locale")
     p_status.set_defaults(func=cmd_status)
